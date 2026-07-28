@@ -5,8 +5,9 @@ import { STARTER_TEMPLATES } from './constants';
 
 const starterTemplateSelectionPrompt = (templates: Template[]) => `
 You are an experienced developer who helps people choose the best starter template for their projects.
-IMPORTANT: Vite is preferred
+IMPORTANT: Vite is preferred.
 IMPORTANT: Only choose shadcn templates if the user explicitly asks for shadcn.
+IMPORTANT: templateName must exactly match one of the names listed below, or blank.
 
 Available templates:
 <template>
@@ -28,18 +29,18 @@ ${templates
 
 Response Format:
 <selection>
-  <templateName>{selected template name}</templateName>
+  <templateName>{exact selected template name}</templateName>
   <title>{a proper title for the project}</title>
 </selection>
 
 Examples:
 
 <example>
-User: I need to build a todo app
+User: I need to build a todo app in React
 Response:
 <selection>
-  <templateName>react-basic-starter</templateName>
-  <title>Simple React todo application</title>
+  <templateName>Vite React</templateName>
+  <title>React todo application</title>
 </selection>
 </example>
 
@@ -48,136 +49,203 @@ User: Write a script to generate numbers from 1 to 100
 Response:
 <selection>
   <templateName>blank</templateName>
-  <title>script to generate numbers from 1 to 100</title>
+  <title>Number generation script</title>
 </selection>
 </example>
 
 Instructions:
-1. For trivial tasks and simple scripts, always recommend the blank template
-2. For more complex projects, recommend templates from the provided list
-3. Follow the exact XML format
-4. Consider both technical requirements and tags
-5. If no perfect match exists, recommend the closest option
-
-Important: Provide only the selection tags in your response, no additional text.
-MOST IMPORTANT: YOU DONT HAVE TIME TO THINK JUST START RESPONDING BASED ON HUNCH 
+1. For trivial tasks and simple scripts, recommend blank.
+2. For applications, recommend exactly one template from the provided list.
+3. Follow the exact XML format.
+4. Never invent or rename a template.
+5. Provide only the selection tags, with no additional text.
 `;
-
-const templates: Template[] = STARTER_TEMPLATES.filter((t) => !t.name.includes('shadcn'));
 
 const parseSelectedTemplate = (llmOutput: string): { template: string; title: string } | null => {
   try {
-    // Extract content between <templateName> tags
-    const templateNameMatch = llmOutput.match(/<templateName>(.*?)<\/templateName>/);
-    const titleMatch = llmOutput.match(/<title>(.*?)<\/title>/);
+    const templateNameMatch = llmOutput.match(/<templateName>(.*?)<\/templateName>/s);
+    const titleMatch = llmOutput.match(/<title>(.*?)<\/title>/s);
 
     if (!templateNameMatch) {
       return null;
     }
 
-    return { template: templateNameMatch[1].trim(), title: titleMatch?.[1].trim() || 'Untitled Project' };
+    return {
+      template: templateNameMatch[1].trim(),
+      title: titleMatch?.[1].trim() || 'Untitled Project',
+    };
   } catch (error) {
     console.error('Error parsing template selection:', error);
     return null;
   }
 };
 
-export const selectStarterTemplate = async (options: { message: string; model: string; provider: ProviderInfo }) => {
-  const { message, model, provider } = options;
-  const requestBody = {
-    message,
-    model,
-    provider,
-    system: starterTemplateSelectionPrompt(templates),
-  };
-  const response = await fetch('/api/llmcall', {
-    method: 'POST',
-    body: JSON.stringify(requestBody),
-  });
-  const respJson: { text: string } = await response.json();
-  console.log(respJson);
-
-  const { text } = respJson;
-  const selectedTemplate = parseSelectedTemplate(text);
-
-  if (selectedTemplate) {
-    return selectedTemplate;
-  } else {
-    console.log('No template selected, using blank template');
-
-    return {
-      template: 'blank',
-      title: '',
-    };
-  }
+const TEMPLATE_ALIASES: Record<string, string> = {
+  'react-basic-starter': 'Vite React',
+  'react-vite': 'Vite React',
+  'vite-react': 'Vite React',
+  'vite react typescript': 'Vite React',
+  'next.js': 'NextJS Shadcn',
+  nextjs: 'NextJS Shadcn',
+  astro: 'Basic Astro',
+  expo: 'Expo App',
+  remix: 'Remix Typescript',
+  svelte: 'Sveltekit',
+  sveltekit: 'Sveltekit',
+  angular: 'Angular',
+  vue: 'Vue',
+  solid: 'SolidJS',
+  solidjs: 'SolidJS',
 };
 
-const getGitHubRepoContent = async (repoName: string): Promise<{ name: string; path: string; content: string }[]> => {
-  try {
-    // Instead of directly fetching from GitHub, use our own API endpoint as a proxy
-    const response = await fetch(`/api/github-template?repo=${encodeURIComponent(repoName)}`);
+function normalizeTemplateName(templateName: string, availableTemplates: Template[]): string | null {
+  const normalized = templateName.trim().toLowerCase();
 
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    // Our API will return the files in the format we need
-    const files = (await response.json()) as any;
-
-    return files;
-  } catch (error) {
-    console.error('Error fetching release contents:', error);
-    throw error;
+  if (normalized === 'blank') {
+    return 'blank';
   }
-};
 
-export async function getTemplates(templateName: string, title?: string) {
-  const template = STARTER_TEMPLATES.find((t) => t.name == templateName);
+  const directMatch = availableTemplates.find(
+    (template) => template.name.toLowerCase() === normalized || template.label.toLowerCase() === normalized,
+  );
 
-  if (!template) {
+  if (directMatch) {
+    return directMatch.name;
+  }
+
+  const alias = TEMPLATE_ALIASES[normalized];
+
+  if (!alias) {
     return null;
   }
 
-  const githubRepo = template.githubRepo;
-  const files = await getGitHubRepoContent(githubRepo);
+  return availableTemplates.some((template) => template.name === alias) ? alias : null;
+}
 
-  let filteredFiles = files;
+function inferStarterTemplate(message: string, availableTemplates: Template[]): string {
+  const input = message.toLowerCase();
+  const candidates: Array<[RegExp, string]> = [
+    [/\b(expo|react native|android|ios|mobile app)\b/, 'Expo App'],
+    [/\b(next(?:\.js|js)?|server components)\b/, 'NextJS Shadcn'],
+    [/\b(astro)\b/, 'Basic Astro'],
+    [/\b(remix)\b/, 'Remix Typescript'],
+    [/\b(qwik)\b/, 'Qwik Typescript'],
+    [/\b(svelte|sveltekit)\b/, 'Sveltekit'],
+    [/\b(vue)\b/, 'Vue'],
+    [/\b(angular)\b/, 'Angular'],
+    [/\b(solid|solidjs)\b/, 'SolidJS'],
+    [/\b(slidev|presentation deck)\b/, 'Slidev'],
+    [/\b(vanilla javascript|vanilla js)\b/, 'Vanilla Vite'],
+    [/\b(react|todo|dashboard|website|web app|spa|application)\b/, 'Vite React'],
+    [/\b(typescript|vite)\b/, 'Vite Typescript'],
+  ];
 
-  /*
-   * ignoring common unwanted files
-   * exclude    .git
-   */
-  filteredFiles = filteredFiles.filter((x) => x.path.startsWith('.git') == false);
-
-  /*
-   * exclude    lock files
-   * WE NOW INCLUDE LOCK FILES FOR IMPROVED INSTALL TIMES
-   */
-  {
-    /*
-     *const comminLockFiles = ['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'];
-     *filteredFiles = filteredFiles.filter((x) => comminLockFiles.includes(x.name) == false);
-     */
+  for (const [pattern, templateName] of candidates) {
+    if (pattern.test(input) && availableTemplates.some((template) => template.name === templateName)) {
+      return templateName;
+    }
   }
 
-  // exclude    .bolt
-  filteredFiles = filteredFiles.filter((x) => x.path.startsWith('.bolt') == false);
+  return 'blank';
+}
 
-  // check for ignore file in .bolt folder
-  const templateIgnoreFile = files.find((x) => x.path.startsWith('.bolt') && x.name == 'ignore');
+export const selectStarterTemplate = async (options: { message: string; model: string; provider: ProviderInfo }) => {
+  const { message, model, provider } = options;
+  const explicitlyRequestsShadcn = /\bshadcn(?:\/ui)?\b/i.test(message);
+  const availableTemplates = explicitlyRequestsShadcn
+    ? STARTER_TEMPLATES
+    : STARTER_TEMPLATES.filter((template) => !template.name.toLowerCase().includes('shadcn'));
+  const fallbackTemplate = inferStarterTemplate(message, availableTemplates);
 
+  try {
+    const response = await fetch('/api/llmcall', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        message,
+        model,
+        provider,
+        system: starterTemplateSelectionPrompt(availableTemplates),
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Template selection failed with status ${response.status}`);
+    }
+
+    const respJson = (await response.json()) as { text?: string };
+    const selectedTemplate = respJson.text ? parseSelectedTemplate(respJson.text) : null;
+    const normalizedTemplate = selectedTemplate
+      ? normalizeTemplateName(selectedTemplate.template, availableTemplates)
+      : null;
+
+    if (normalizedTemplate) {
+      return {
+        template: normalizedTemplate,
+        title: selectedTemplate?.title || 'Untitled Project',
+      };
+    }
+
+    console.warn('Template selector returned an unknown template; using deterministic fallback', {
+      selected: selectedTemplate?.template,
+      fallbackTemplate,
+    });
+  } catch (error) {
+    console.warn('Template selection request failed; using deterministic fallback', error);
+  }
+
+  return {
+    template: fallbackTemplate,
+    title: message.slice(0, 80).trim() || 'Untitled Project',
+  };
+};
+
+const getGitHubRepoContent = async (repoName: string): Promise<{ name: string; path: string; content: string }[]> => {
+  const response = await fetch(`/api/github-template?repo=${encodeURIComponent(repoName)}`);
+  const payload = (await response.json().catch(() => null)) as
+    | { name: string; path: string; content: string }[]
+    | { error?: string; details?: string }
+    | null;
+
+  if (!response.ok) {
+    const details = payload && !Array.isArray(payload) ? payload.details || payload.error : undefined;
+    throw new Error(details || `Template import failed with status ${response.status}`);
+  }
+
+  if (!Array.isArray(payload)) {
+    throw new Error('Template import returned an invalid response');
+  }
+
+  return payload;
+};
+
+export async function getTemplates(templateName: string, title?: string) {
+  const template = STARTER_TEMPLATES.find((candidate) => candidate.name === templateName);
+
+  if (!template) {
+    throw new Error(`Unknown starter template: ${templateName}`);
+  }
+
+  const files = await getGitHubRepoContent(template.githubRepo);
+  let filteredFiles = files.filter((file) => !file.path.startsWith('.git'));
+
+  filteredFiles = filteredFiles.filter((file) => !file.path.startsWith('.bolt'));
+
+  const templateIgnoreFile = files.find((file) => file.path.startsWith('.bolt') && file.name === 'ignore');
   const filesToImport = {
     files: filteredFiles,
     ignoreFile: [] as typeof filteredFiles,
   };
 
   if (templateIgnoreFile) {
-    // redacting files specified in ignore file
-    const ignorepatterns = templateIgnoreFile.content.split('\n').map((x) => x.trim());
-    const ig = ignore().add(ignorepatterns);
-
-    // filteredFiles = filteredFiles.filter(x => !ig.ignores(x.path))
-    const ignoredFiles = filteredFiles.filter((x) => ig.ignores(x.path));
+    const ignorePatterns = templateIgnoreFile.content
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const ignoredMatcher = ignore().add(ignorePatterns);
+    const ignoredFiles = filteredFiles.filter((file) => ignoredMatcher.ignores(file.path));
 
     filesToImport.files = filteredFiles;
     filesToImport.ignoreFile = ignoredFiles;
@@ -196,8 +264,8 @@ ${file.content}
   .join('\n')}
 </boltArtifact>
 `;
-  let userMessage = ``;
-  const templatePromptFile = files.filter((x) => x.path.startsWith('.bolt')).find((x) => x.name == 'prompt');
+  let userMessage = '';
+  const templatePromptFile = files.find((file) => file.path.startsWith('.bolt') && file.name === 'prompt');
 
   if (templatePromptFile) {
     userMessage = `
@@ -209,9 +277,7 @@ ${templatePromptFile.content}
   }
 
   if (filesToImport.ignoreFile.length > 0) {
-    userMessage =
-      userMessage +
-      `
+    userMessage += `
 STRICT FILE ACCESS RULES - READ CAREFULLY:
 
 The following files are READ-ONLY and must never be modified:
@@ -230,22 +296,16 @@ Strictly forbidden actions:
 ❌ Create new versions of these files
 ❌ Suggest changes to these files
 
-Any attempt to modify these protected files will result in immediate termination of the operation.
-
-If you need to make changes to functionality, create new files instead of modifying the protected ones listed above.
+If functionality must change, create new files instead of modifying the protected files listed above.
 ---
 `;
   }
 
   userMessage += `
 ---
-template import is done, and you can now use the imported files,
-edit only the files that need to be changed, and you can create new files as needed.
-NO NOT EDIT/WRITE ANY FILES THAT ALREADY EXIST IN THE PROJECT AND DOES NOT NEED TO BE MODIFIED
+Template import is complete. Continue with the original request and edit only the files that require changes.
 ---
-Now that the Template is imported please continue with my original request
-
-IMPORTANT: Dont Forget to install the dependencies before running the app by using \`npm install && npm run dev\`
+Install dependencies and start the application with: npm install && npm run dev
 `;
 
   return {
