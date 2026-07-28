@@ -68,13 +68,10 @@ async function fetchRepoContents(repo: string, githubToken?: string): Promise<Te
     throw new Error(`Repository has no default branch: ${repo}`);
   }
 
-  const archiveResponse = await fetch(
-    `${GITHUB_API_BASE}/repos/${repo}/zipball/${encodeURIComponent(defaultBranch)}`,
-    {
-      headers,
-      redirect: 'follow',
-    },
-  );
+  const archiveResponse = await fetch(`${GITHUB_API_BASE}/repos/${repo}/zipball/${encodeURIComponent(defaultBranch)}`, {
+    headers,
+    redirect: 'follow',
+  });
 
   if (!archiveResponse.ok) {
     throw new Error(`Repository archive download failed (${archiveResponse.status}): ${repo}@${defaultBranch}`);
