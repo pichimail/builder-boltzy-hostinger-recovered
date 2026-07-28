@@ -9,12 +9,19 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   exit 1
 fi
 
-SITE_FILE="$({
+SITE_FILE_LINK="$({
   grep -RIlE "server_name[^;]*${DOMAIN//./\\.}" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null || true
 } | head -n 1)"
 
-if [[ -z "$SITE_FILE" ]]; then
+if [[ -z "$SITE_FILE_LINK" ]]; then
   echo "Could not find an Nginx server block for ${DOMAIN}." >&2
+  exit 1
+fi
+
+SITE_FILE="$(readlink -f "$SITE_FILE_LINK")"
+
+if [[ -z "$SITE_FILE" || ! -f "$SITE_FILE" ]]; then
+  echo "Could not resolve the Nginx configuration file: ${SITE_FILE_LINK}." >&2
   exit 1
 fi
 
