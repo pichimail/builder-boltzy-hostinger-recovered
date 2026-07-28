@@ -1,242 +1,173 @@
 import { json } from '@remix-run/cloudflare';
 import JSZip from 'jszip';
 
-// Function to detect if we're running in Cloudflare
-function isCloudflareEnvironment(context: any): boolean {
-  // Check if we're in production AND have Cloudflare Pages specific env vars
-  const isProduction = process.env.NODE_ENV === 'production';
-  const hasCfPagesVars = !!(
-    context?.cloudflare?.env?.CF_PAGES ||
-    context?.cloudflare?.env?.CF_PAGES_URL ||
-    context?.cloudflare?.env?.CF_PAGES_COMMIT_SHA
-  );
-
-  return isProduction && hasCfPagesVars;
+interface TemplateFile {
+  name: string;
+  path: string;
+  content: string;
 }
 
-// Cloudflare-compatible method using GitHub Contents API
-async function fetchRepoContentsCloudflare(repo: string, githubToken?: string) {
-  const baseUrl = 'https://api.github.com';
+const GITHUB_API_BASE = 'https://api.github.com';
+const MAX_TEMPLATE_FILES = 300;
+const MAX_TEMPLATE_FILE_BYTES = 500_000;
+const MAX_TEMPLATE_TOTAL_BYTES = 8_000_000;
 
-  // Get repository info to find default branch
-  const repoResponse = await fetch(`${baseUrl}/repos/${repo}`, {
-    headers: {
-      Accept: 'application/vnd.github.v3+json',
-      'User-Agent': 'Chinna-DIY',
-      ...(githubToken ? { Authorization: `Bearer ${githubToken}` } : {}),
-    },
-  });
+function githubHeaders(githubToken?: string): HeadersInit {
+  return {
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'Chinna-DIY',
+    'X-GitHub-Api-Version': '2022-11-28',
+    ...(githubToken ? { Authorization: `Bearer ${githubToken}` } : {}),
+  };
+}
+
+function validateRepositoryName(repo: string): boolean {
+  return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo);
+}
+
+function normalizeArchivePath(filename: string, rootFolderName: string): string {
+  if (rootFolderName && filename.startsWith(`${rootFolderName}/`)) {
+    return filename.slice(rootFolderName.length + 1);
+  }
+
+  return filename;
+}
+
+function shouldSkipFile(path: string, size: number): boolean {
+  if (!path || path.startsWith('.git/') || path.includes('/.git/')) {
+    return true;
+  }
+
+  if (size > MAX_TEMPLATE_FILE_BYTES) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Download the repository's default branch archive.
+ *
+ * The previous implementation requested /releases/latest. Most starter-template
+ * repositories do not publish GitHub releases, so valid templates failed with a
+ * 404 and the client silently continued with a blank project. A branch archive
+ * exists for normal repositories and also avoids one GitHub API call per file.
+ */
+async function fetchRepoContents(repo: string, githubToken?: string): Promise<TemplateFile[]> {
+  const headers = githubHeaders(githubToken);
+  const repoResponse = await fetch(`${GITHUB_API_BASE}/repos/${repo}`, { headers });
 
   if (!repoResponse.ok) {
-    throw new Error(`Repository not found: ${repo}`);
+    throw new Error(`Repository lookup failed (${repoResponse.status}): ${repo}`);
   }
 
-  const repoData = (await repoResponse.json()) as any;
+  const repoData = (await repoResponse.json()) as { default_branch?: string };
   const defaultBranch = repoData.default_branch;
 
-  // Get the tree recursively
-  const treeResponse = await fetch(`${baseUrl}/repos/${repo}/git/trees/${defaultBranch}?recursive=1`, {
-    headers: {
-      Accept: 'application/vnd.github.v3+json',
-      'User-Agent': 'Chinna-DIY',
-      ...(githubToken ? { Authorization: `Bearer ${githubToken}` } : {}),
-    },
-  });
-
-  if (!treeResponse.ok) {
-    throw new Error(`Failed to fetch repository tree: ${treeResponse.status}`);
+  if (!defaultBranch) {
+    throw new Error(`Repository has no default branch: ${repo}`);
   }
 
-  const treeData = (await treeResponse.json()) as any;
-
-  // Filter for files only (not directories) and limit size
-  const files = treeData.tree.filter((item: any) => {
-    if (item.type !== 'blob') {
-      return false;
-    }
-
-    if (item.path.startsWith('.git/')) {
-      return false;
-    }
-
-    // Allow lock files even if they're large
-    const isLockFile =
-      item.path.endsWith('package-lock.json') ||
-      item.path.endsWith('yarn.lock') ||
-      item.path.endsWith('pnpm-lock.yaml');
-
-    // For non-lock files, limit size to 100KB
-    if (!isLockFile && item.size >= 100000) {
-      return false;
-    }
-
-    return true;
+  const archiveResponse = await fetch(`${GITHUB_API_BASE}/repos/${repo}/zipball/${encodeURIComponent(defaultBranch)}`, {
+    headers,
+    redirect: 'follow',
   });
 
-  // Fetch file contents in batches to avoid overwhelming the API
-  const batchSize = 10;
-  const fileContents = [];
-
-  for (let i = 0; i < files.length; i += batchSize) {
-    const batch = files.slice(i, i + batchSize);
-    const batchPromises = batch.map(async (file: any) => {
-      try {
-        const contentResponse = await fetch(`${baseUrl}/repos/${repo}/contents/${file.path}`, {
-          headers: {
-            Accept: 'application/vnd.github.v3+json',
-            'User-Agent': 'Chinna-DIY',
-            ...(githubToken ? { Authorization: `Bearer ${githubToken}` } : {}),
-          },
-        });
-
-        if (!contentResponse.ok) {
-          console.warn(`Failed to fetch ${file.path}: ${contentResponse.status}`);
-          return null;
-        }
-
-        const contentData = (await contentResponse.json()) as any;
-        const content = atob(contentData.content.replace(/\s/g, ''));
-
-        return {
-          name: file.path.split('/').pop() || '',
-          path: file.path,
-          content,
-        };
-      } catch (error) {
-        console.warn(`Error fetching ${file.path}:`, error);
-        return null;
-      }
-    });
-
-    const batchResults = await Promise.all(batchPromises);
-    fileContents.push(...batchResults.filter(Boolean));
-
-    // Add a small delay between batches to be respectful to the API
-    if (i + batchSize < files.length) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+  if (!archiveResponse.ok) {
+    throw new Error(`Repository archive download failed (${archiveResponse.status}): ${repo}@${defaultBranch}`);
   }
 
-  return fileContents;
-}
+  const zip = await JSZip.loadAsync(await archiveResponse.arrayBuffer());
+  const entries = Object.values(zip.files);
+  const firstNestedEntry = entries.find((entry) => entry.name.includes('/'));
+  const rootFolderName = firstNestedEntry?.name.split('/')[0] || '';
+  const files: TemplateFile[] = [];
+  let totalBytes = 0;
 
-// Your existing method for non-Cloudflare environments
-async function fetchRepoContentsZip(repo: string, githubToken?: string) {
-  const baseUrl = 'https://api.github.com';
-
-  // Get the latest release
-  const releaseResponse = await fetch(`${baseUrl}/repos/${repo}/releases/latest`, {
-    headers: {
-      Accept: 'application/vnd.github.v3+json',
-      'User-Agent': 'Chinna-DIY',
-      ...(githubToken ? { Authorization: `Bearer ${githubToken}` } : {}),
-    },
-  });
-
-  if (!releaseResponse.ok) {
-    throw new Error(`GitHub API error: ${releaseResponse.status} - ${releaseResponse.statusText}`);
-  }
-
-  const releaseData = (await releaseResponse.json()) as any;
-  const zipballUrl = releaseData.zipball_url;
-
-  // Fetch the zipball
-  const zipResponse = await fetch(zipballUrl, {
-    headers: {
-      ...(githubToken ? { Authorization: `Bearer ${githubToken}` } : {}),
-    },
-  });
-
-  if (!zipResponse.ok) {
-    throw new Error(`Failed to fetch release zipball: ${zipResponse.status}`);
-  }
-
-  // Get the zip content as ArrayBuffer
-  const zipArrayBuffer = await zipResponse.arrayBuffer();
-
-  // Use JSZip to extract the contents
-  const zip = await JSZip.loadAsync(zipArrayBuffer);
-
-  // Find the root folder name
-  let rootFolderName = '';
-  zip.forEach((relativePath) => {
-    if (!rootFolderName && relativePath.includes('/')) {
-      rootFolderName = relativePath.split('/')[0];
-    }
-  });
-
-  // Extract all files
-  const promises = Object.keys(zip.files).map(async (filename) => {
-    const zipEntry = zip.files[filename];
-
-    // Skip directories
-    if (zipEntry.dir) {
-      return null;
+  for (const entry of entries) {
+    if (entry.dir) {
+      continue;
     }
 
-    // Skip the root folder itself
-    if (filename === rootFolderName) {
-      return null;
+    const path = normalizeArchivePath(entry.name, rootFolderName);
+    const rawSize = (entry as any)._data?.uncompressedSize ?? 0;
+
+    if (shouldSkipFile(path, rawSize)) {
+      continue;
     }
 
-    // Remove the root folder from the path
-    let normalizedPath = filename;
-
-    if (rootFolderName && filename.startsWith(rootFolderName + '/')) {
-      normalizedPath = filename.substring(rootFolderName.length + 1);
+    if (files.length >= MAX_TEMPLATE_FILES) {
+      throw new Error(`Template contains more than ${MAX_TEMPLATE_FILES} files`);
     }
 
-    // Get the file content
-    const content = await zipEntry.async('string');
+    const content = await entry.async('string');
+    const contentBytes = new TextEncoder().encode(content).byteLength;
 
-    return {
-      name: normalizedPath.split('/').pop() || '',
-      path: normalizedPath,
+    if (contentBytes > MAX_TEMPLATE_FILE_BYTES) {
+      continue;
+    }
+
+    totalBytes += contentBytes;
+
+    if (totalBytes > MAX_TEMPLATE_TOTAL_BYTES) {
+      throw new Error(`Template exceeds ${MAX_TEMPLATE_TOTAL_BYTES} bytes after extraction`);
+    }
+
+    files.push({
+      name: path.split('/').pop() || '',
+      path,
       content,
-    };
-  });
+    });
+  }
 
-  const results = await Promise.all(promises);
+  if (files.length === 0) {
+    throw new Error(`Template archive contained no importable files: ${repo}`);
+  }
 
-  return results.filter(Boolean);
+  return files;
 }
 
 export async function loader({ request, context }: { request: Request; context: any }) {
   const url = new URL(request.url);
-  const repo = url.searchParams.get('repo');
+  const repo = url.searchParams.get('repo')?.trim();
 
   if (!repo) {
     return json({ error: 'Repository name is required' }, { status: 400 });
   }
 
+  if (!validateRepositoryName(repo)) {
+    return json({ error: 'Repository must use the owner/name format' }, { status: 400 });
+  }
+
   try {
-    // Access environment variables from Cloudflare context or process.env
     const githubToken =
-      context?.cloudflare?.env?.GITHUB_TOKEN || process.env.GITHUB_TOKEN || process.env.VITE_GITHUB_ACCESS_TOKEN;
+      context?.cloudflare?.env?.GITHUB_TOKEN ||
+      context?.cloudflare?.env?.GITHUB_API_KEY ||
+      process.env.GITHUB_TOKEN ||
+      process.env.GITHUB_API_KEY ||
+      process.env.VITE_GITHUB_ACCESS_TOKEN;
 
-    let fileList;
+    const files = await fetchRepoContents(repo, githubToken);
 
-    if (isCloudflareEnvironment(context)) {
-      fileList = await fetchRepoContentsCloudflare(repo, githubToken);
-    } else {
-      fileList = await fetchRepoContentsZip(repo, githubToken);
-    }
-
-    // Filter out .git files for both methods
-    const filteredFiles = fileList.filter((file: any) => !file.path.startsWith('.git'));
-
-    return json(filteredFiles);
+    return json(files, {
+      headers: {
+        'Cache-Control': 'private, max-age=300',
+      },
+    });
   } catch (error) {
-    console.error('Error processing GitHub template:', error);
-    console.error('Repository:', repo);
-    console.error('Error details:', error instanceof Error ? error.message : String(error));
+    const details = error instanceof Error ? error.message : String(error);
+
+    console.error('Error processing GitHub template:', {
+      repo,
+      details,
+    });
 
     return json(
       {
         error: 'Failed to fetch template files',
-        details: error instanceof Error ? error.message : String(error),
+        details,
       },
-      { status: 500 },
+      { status: 502 },
     );
   }
 }
