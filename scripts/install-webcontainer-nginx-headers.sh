@@ -70,56 +70,96 @@ def strip_cross_origin_directives(block: str) -> str:
     ]
     for pattern in patterns:
         block = re.sub(pattern, "", block, flags=re.I | re.M)
-    block = re.sub(r"\n{3,}", "\n\n", block)
-    return block
+    return re.sub(r"\n{3,}", "\n\n", block)
 
-server_match = None
-for match in re.finditer(r"server\s*\{", text, flags=re.M):
-    brace = text.find("{", match.start())
-    end = block_end(text, brace)
-    if end is None:
-        continue
-    candidate = text[match.start():end]
-    if re.search(rf"server_name\s+[^;]*\b{re.escape(domain)}\b[^;]*;", candidate):
-        server_match = (match.start(), end, candidate)
-        break
 
-if server_match is None:
+def matching_server_blocks(source: str) -> list[tuple[int, int, str]]:
+    blocks: list[tuple[int, int, str]] = []
+    for match in re.finditer(r"server\s*\{", source, flags=re.M):
+        brace = source.find("{", match.start())
+        end = block_end(source, brace)
+        if end is None:
+            continue
+        block = source[match.start():end]
+        if re.search(rf"server_name\s+[^;]*\b{re.escape(domain)}\b[^;]*;", block):
+            blocks.append((match.start(), end, block))
+    return blocks
+
+
+def add_snippet_to_proxy_locations(server_block: str) -> tuple[str, int]:
+    locations: list[tuple[int, int, str]] = []
+
+    for match in re.finditer(r"location(?:\s+[^\{]+)?\s*\{", server_block, flags=re.M):
+        brace = server_block.find("{", match.start())
+        end = block_end(server_block, brace)
+        if end is None:
+            continue
+
+        location_block = server_block[match.start():end]
+        if not re.search(r"\bproxy_pass\b", location_block):
+            continue
+
+        line_start = server_block.rfind("\n", 0, match.start()) + 1
+        indent = server_block[line_start:match.start()]
+        locations.append((match.start(), end, indent))
+
+    for start, end, indent in reversed(locations):
+        location_block = strip_cross_origin_directives(server_block[start:end])
+        brace = location_block.find("{")
+        include_line = f"\n{indent}    include {snippet};"
+        location_block = location_block[: brace + 1] + include_line + location_block[brace + 1 :]
+        server_block = server_block[:start] + location_block + server_block[end:]
+
+    return server_block, len(locations)
+
+
+servers = matching_server_blocks(text)
+if not servers:
     print(f"No matching server block for {domain} in {site_path}", file=sys.stderr)
     raise SystemExit(1)
 
-server_start, server_end, server_block = server_match
-server_block = strip_cross_origin_directives(server_block)
+# Prefer the actual reverse-proxy server. This avoids editing the first matching
+# block when it is only the port-80 redirect server.
+selected_index = next((index for index, (_, _, block) in enumerate(servers) if re.search(r"\bproxy_pass\b", block)), None)
+if selected_index is None:
+    selected_index = next(
+        (
+            index
+            for index, (_, _, block) in enumerate(servers)
+            if re.search(r"\blisten\s+[^;]*(?:443|ssl)\b", block)
+        ),
+        None,
+    )
 
-location_ranges: list[tuple[int, int]] = []
-for match in re.finditer(r"location(?:\s+[^\{]+)?\s*\{", server_block, flags=re.M):
-    brace = server_block.find("{", match.start())
-    end = block_end(server_block, brace)
-    if end is None:
-        continue
-    location_block = server_block[match.start():end]
-    if re.search(r"\bproxy_pass\b", location_block):
-        location_ranges.append((match.start(), end))
+if selected_index is None:
+    print(f"Could not find an HTTPS/proxy server block for {domain}", file=sys.stderr)
+    raise SystemExit(1)
 
-include_line = f"    include {snippet};"
+replacements: list[tuple[int, int, str]] = []
+proxy_location_count = 0
 
-if location_ranges:
-    for start, end in reversed(location_ranges):
-        location_block = strip_cross_origin_directives(server_block[start:end])
-        brace = location_block.find("{")
-        location_block = location_block[: brace + 1] + "\n" + include_line + location_block[brace + 1 :]
-        server_block = server_block[:start] + location_block + server_block[end:]
-else:
-    server_name = re.search(r"server_name\s+[^;]*;", server_block)
-    if not server_name:
-        print(f"No server_name directive found for {domain}", file=sys.stderr)
-        raise SystemExit(1)
-    insert_at = server_name.end()
-    server_block = server_block[:insert_at] + "\n" + include_line + server_block[insert_at:]
+for index, (start, end, block) in enumerate(servers):
+    cleaned = strip_cross_origin_directives(block)
 
-text = text[:server_start] + server_block + text[server_end:]
+    if index == selected_index:
+        cleaned, proxy_location_count = add_snippet_to_proxy_locations(cleaned)
+        if proxy_location_count == 0:
+            server_name = re.search(r"server_name\s+[^;]*;", cleaned)
+            if not server_name:
+                print(f"No server_name directive found for {domain}", file=sys.stderr)
+                raise SystemExit(1)
+            cleaned = cleaned[: server_name.end()] + f"\n    include {snippet};" + cleaned[server_name.end() :]
+
+    replacements.append((start, end, cleaned))
+
+for start, end, replacement in reversed(replacements):
+    text = text[:start] + replacement + text[end:]
+
 site_path.write_text(text)
-print(f"Normalised WebContainer headers in {site_path}")
+print(
+    f"Normalised WebContainer headers in {site_path}; "
+    f"targeted proxy locations: {proxy_location_count}"
+)
 PY
 
 if ! nginx -t; then
