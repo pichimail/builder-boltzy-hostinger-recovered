@@ -48,41 +48,78 @@ site_path = Path(sys.argv[1])
 domain = sys.argv[2]
 snippet = sys.argv[3]
 text = site_path.read_text()
-include_line = f"    include {snippet};"
 
-if include_line in text:
-    print(f"Header snippet is already included in {site_path}")
-    raise SystemExit(0)
 
-server_pattern = re.compile(r"server\s*\{", re.M)
-for match in server_pattern.finditer(text):
-    start = match.start()
-    brace = text.find("{", start)
+def block_end(source: str, open_brace: int) -> int | None:
     depth = 0
-    end = None
-    for index in range(brace, len(text)):
-        if text[index] == "{":
+    for index in range(open_brace, len(source)):
+        if source[index] == "{":
             depth += 1
-        elif text[index] == "}":
+        elif source[index] == "}":
             depth -= 1
             if depth == 0:
-                end = index + 1
-                break
+                return index + 1
+    return None
+
+
+def strip_cross_origin_directives(block: str) -> str:
+    patterns = [
+        rf"^\s*include\s+{re.escape(snippet)}\s*;\s*$",
+        r"^\s*proxy_hide_header\s+Cross-Origin-(?:Opener|Embedder|Resource)-Policy\s*;\s*$",
+        r"^\s*add_header\s+Cross-Origin-(?:Opener|Embedder|Resource)-Policy\b[^;]*;\s*$",
+    ]
+    for pattern in patterns:
+        block = re.sub(pattern, "", block, flags=re.I | re.M)
+    block = re.sub(r"\n{3,}", "\n\n", block)
+    return block
+
+server_match = None
+for match in re.finditer(r"server\s*\{", text, flags=re.M):
+    brace = text.find("{", match.start())
+    end = block_end(text, brace)
     if end is None:
         continue
-    block = text[start:end]
-    if re.search(rf"server_name\s+[^;]*\b{re.escape(domain)}\b[^;]*;", block):
-        server_name = re.search(r"server_name\s+[^;]*;", block)
-        if not server_name:
-            continue
-        insert_at = start + server_name.end()
-        text = text[:insert_at] + "\n" + include_line + text[insert_at:]
-        site_path.write_text(text)
-        print(f"Installed WebContainer headers in {site_path}")
-        raise SystemExit(0)
+    candidate = text[match.start():end]
+    if re.search(rf"server_name\s+[^;]*\b{re.escape(domain)}\b[^;]*;", candidate):
+        server_match = (match.start(), end, candidate)
+        break
 
-print(f"No matching server block for {domain} in {site_path}", file=sys.stderr)
-raise SystemExit(1)
+if server_match is None:
+    print(f"No matching server block for {domain} in {site_path}", file=sys.stderr)
+    raise SystemExit(1)
+
+server_start, server_end, server_block = server_match
+server_block = strip_cross_origin_directives(server_block)
+
+location_ranges: list[tuple[int, int]] = []
+for match in re.finditer(r"location(?:\s+[^\{]+)?\s*\{", server_block, flags=re.M):
+    brace = server_block.find("{", match.start())
+    end = block_end(server_block, brace)
+    if end is None:
+        continue
+    location_block = server_block[match.start():end]
+    if re.search(r"\bproxy_pass\b", location_block):
+        location_ranges.append((match.start(), end))
+
+include_line = f"    include {snippet};"
+
+if location_ranges:
+    for start, end in reversed(location_ranges):
+        location_block = strip_cross_origin_directives(server_block[start:end])
+        brace = location_block.find("{")
+        location_block = location_block[: brace + 1] + "\n" + include_line + location_block[brace + 1 :]
+        server_block = server_block[:start] + location_block + server_block[end:]
+else:
+    server_name = re.search(r"server_name\s+[^;]*;", server_block)
+    if not server_name:
+        print(f"No server_name directive found for {domain}", file=sys.stderr)
+        raise SystemExit(1)
+    insert_at = server_name.end()
+    server_block = server_block[:insert_at] + "\n" + include_line + server_block[insert_at:]
+
+text = text[:server_start] + server_block + text[server_end:]
+site_path.write_text(text)
+print(f"Normalised WebContainer headers in {site_path}")
 PY
 
 if ! nginx -t; then
@@ -94,14 +131,27 @@ fi
 
 systemctl reload nginx
 
-echo
-echo "Response headers for https://${DOMAIN}/:"
-curl -fsSI "https://${DOMAIN}/" \
-  | tr -d '\r' \
-  | grep -Ei '^(HTTP/|cross-origin-(opener|embedder|resource)-policy:)' || true
+for _ in $(seq 1 30); do
+  if curl -fsS "https://${DOMAIN}/" >/dev/null; then
+    break
+  fi
+  sleep 2
+done
 
-echo
-echo "Expected:"
-echo "  Cross-Origin-Opener-Policy: same-origin"
-echo "  Cross-Origin-Embedder-Policy: credentialless"
+HEADERS="$(curl -fsSI "https://${DOMAIN}/" | tr -d '\r')"
+printf '%s\n' "$HEADERS" | grep -Ei '^(HTTP/|cross-origin-(opener|embedder|resource)-policy:)' || true
+
+coop_count="$(printf '%s\n' "$HEADERS" | grep -Eic '^Cross-Origin-Opener-Policy:[[:space:]]*same-origin[[:space:]]*$' || true)"
+coep_count="$(printf '%s\n' "$HEADERS" | grep -Eic '^Cross-Origin-Embedder-Policy:[[:space:]]*credentialless[[:space:]]*$' || true)"
+corp_count="$(printf '%s\n' "$HEADERS" | grep -Eic '^Cross-Origin-Resource-Policy:[[:space:]]*cross-origin[[:space:]]*$' || true)"
+conflict_count="$(printf '%s\n' "$HEADERS" | grep -Eic '^Cross-Origin-Embedder-Policy:[[:space:]]*require-corp[[:space:]]*$' || true)"
+
+if [[ "$coop_count" -ne 1 || "$coep_count" -ne 1 || "$corp_count" -ne 1 || "$conflict_count" -ne 0 ]]; then
+  echo "Cross-origin header validation failed." >&2
+  echo "Expected exactly one same-origin, credentialless, and cross-origin header, with no require-corp value." >&2
+  echo "Backup: ${BACKUP}" >&2
+  exit 1
+fi
+
+echo "WebContainer cross-origin headers are canonical and conflict-free."
 echo "Backup: ${BACKUP}"
