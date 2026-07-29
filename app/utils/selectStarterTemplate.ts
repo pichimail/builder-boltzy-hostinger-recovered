@@ -202,10 +202,16 @@ export const selectStarterTemplate = async (options: { message: string; model: s
   };
 };
 
-const getGitHubRepoContent = async (repoName: string): Promise<{ name: string; path: string; content: string }[]> => {
+interface TemplateFile {
+  name: string;
+  path: string;
+  content: string;
+}
+
+const getGitHubRepoContent = async (repoName: string): Promise<TemplateFile[]> => {
   const response = await fetch(`/api/github-template?repo=${encodeURIComponent(repoName)}`);
   const payload = (await response.json().catch(() => null)) as
-    | { name: string; path: string; content: string }[]
+    | TemplateFile[]
     | { error?: string; details?: string }
     | null;
 
@@ -220,6 +226,36 @@ const getGitHubRepoContent = async (repoName: string): Promise<{ name: string; p
 
   return payload;
 };
+
+function createBootstrapActions(files: TemplateFile[]): string {
+  const packageJsonFile = files.find((file) => file.path === 'package.json' || file.path.endsWith('/package.json'));
+
+  if (packageJsonFile) {
+    try {
+      const packageJson = JSON.parse(packageJsonFile.content) as {
+        scripts?: Record<string, string>;
+      };
+      const scripts = packageJson.scripts || {};
+      const startScript = ['dev', 'start', 'preview'].find((script) => typeof scripts[script] === 'string');
+      const setupAction = '<boltAction type="shell">npm install --no-audit --no-fund</boltAction>';
+
+      if (!startScript) {
+        return setupAction;
+      }
+
+      return `${setupAction}
+<boltAction type="start">npm run ${startScript}</boltAction>`;
+    } catch (error) {
+      console.warn('Unable to parse starter package.json; importing files without automatic startup', error);
+    }
+  }
+
+  if (files.some((file) => file.path === 'index.html' || file.path.endsWith('/index.html'))) {
+    return '<boltAction type="start">npx --yes serve . --listen 4173</boltAction>';
+  }
+
+  return '';
+}
 
 export async function getTemplates(templateName: string, title?: string) {
   const template = STARTER_TEMPLATES.find((candidate) => candidate.name === templateName);
@@ -251,6 +287,7 @@ export async function getTemplates(templateName: string, title?: string) {
     filesToImport.ignoreFile = ignoredFiles;
   }
 
+  const bootstrapActions = createBootstrapActions(filesToImport.files);
   const assistantMessage = `
 Chinna is initializing your project with the required files using the ${template.name} template.
 <boltArtifact id="imported-files" title="${title || 'Create initial files'}" type="bundled">
@@ -262,6 +299,7 @@ ${file.content}
 </boltAction>`,
   )
   .join('\n')}
+${bootstrapActions}
 </boltArtifact>
 `;
   let userMessage = '';
@@ -304,8 +342,8 @@ If functionality must change, create new files instead of modifying the protecte
   userMessage += `
 ---
 Template import is complete. Continue with the original request and edit only the files that require changes.
+Dependency installation and application startup are already queued automatically. Do not emit duplicate install or start actions unless the terminal reports a failure.
 ---
-Install dependencies and start the application with: npm install && npm run dev
 `;
 
   return {
